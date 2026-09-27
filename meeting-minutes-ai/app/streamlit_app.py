@@ -147,6 +147,7 @@ def _init_state() -> None:
         "host_audio_status": None,
         "host_minutes": None,
         "join_meeting": None,
+        "pending_speaker_profiles": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -154,7 +155,14 @@ def _init_state() -> None:
 
 
 def _sign_out() -> None:
-    for key in ("user", "host_meeting_id", "host_meeting_code", "host_minutes", "join_meeting"):
+    for key in (
+        "user",
+        "host_meeting_id",
+        "host_meeting_code",
+        "host_minutes",
+        "join_meeting",
+        "pending_speaker_profiles",
+    ):
         st.session_state[key] = None
     st.rerun()
 
@@ -245,6 +253,15 @@ def _save_live_utterance(meeting_id: int, speaker: str, text: str) -> None:
     db_utils.update_meeting_transcript(meeting_id, "\n".join(transcript_lines))
 
 
+def _speaker_error_message(error: Exception) -> str:
+    if isinstance(error, ModuleNotFoundError) and error.name == "speechbrain":
+        return (
+            "SpeechBrain is missing from the Python environment running Streamlit. "
+            "Install requirements with that same Python, then restart Streamlit."
+        )
+    return str(error)
+
+
 @st.fragment(run_every=1)
 def _show_classifier_report() -> None:
     st.sidebar.markdown("### Classifier report")
@@ -274,28 +291,110 @@ def _render_host_mode() -> bool:
     meeting_id = st.session_state.host_meeting_id
     if meeting_id is None:
         st.markdown('<p class="eyebrow">01 / Host a room</p>', unsafe_allow_html=True)
-        st.markdown('<h1 class="page-title">Start a meeting</h1>', unsafe_allow_html=True)
+        st.markdown('<h1 class="page-title">Prepare a meeting</h1>', unsafe_allow_html=True)
         st.markdown(
-            '<p class="page-subtitle">Create a room, then speak into your microphone to start the transcript.</p>',
+            '<p class="page-subtitle">Record each participant’s voice sample before starting. The samples will identify speakers in the transcript.</p>',
             unsafe_allow_html=True,
         )
-        with st.form("start_meeting_form", clear_on_submit=False):
-            title = st.text_input("Meeting title", placeholder="Quarterly product review")
-            start_meeting = st.form_submit_button("Start Meeting", type="primary")
+        setup_left, setup_right = st.columns([1, 1.1], gap="large")
+        pending_key = "pending_speaker_profiles"
+        pending_profiles = st.session_state.setdefault(pending_key, [])
 
-        if start_meeting:
-            if not title.strip():
-                st.error("Add a meeting title to continue.")
-                return False
-
-            db_utils.init_db()
-            new_meeting_id, meeting_code = db_utils.create_meeting(
-                title.strip(), date.today().isoformat(), user["user_id"]
+        with setup_left:
+            st.markdown("#### Speaker samples")
+            st.caption(
+                "Allow microphone access, record one complete sentence for each participant, then press Stop and save sample. Voice recordings and profiles are saved with the meeting."
             )
-            st.session_state.host_meeting_id = new_meeting_id
-            st.session_state.host_meeting_code = meeting_code
-            st.session_state.host_minutes = None
-            st.rerun()
+            setup_event = _live_speech(
+                active=True,
+                enrollmentOnly=True,
+                speakerCount=len(pending_profiles),
+                key="premeeting_speaker_setup",
+                default=None,
+            )
+            setup_event_key = "premeeting_last_enrollment_id"
+            notice_key = "premeeting_enrollment_notice"
+            if st.session_state.get(notice_key):
+                st.success(st.session_state.pop(notice_key))
+            if (
+                isinstance(setup_event, dict)
+                and setup_event.get("enroll")
+                and setup_event.get("id") != st.session_state.get(setup_event_key)
+            ):
+                try:
+                    from src.speaker_id import decode_wav_base64, embedding_from_wav_base64
+
+                    audio_base64 = str(setup_event.get("audio") or "")
+                    if not audio_base64:
+                        raise ValueError("No voice sample was captured. Try recording again.")
+                    embedding = embedding_from_wav_base64(audio_base64)
+                    speaker_name = f"Speaker {len(pending_profiles) + 1}"
+                    pending_profiles.append(
+                        {
+                            "name": speaker_name,
+                            "embedding": embedding.tolist(),
+                            "samples": 1,
+                            "sample_audio": decode_wav_base64(audio_base64),
+                        }
+                    )
+                    st.session_state[pending_key] = pending_profiles
+                    st.session_state[notice_key] = f"Voice sample saved as {speaker_name}."
+                except Exception as error:
+                    st.session_state[notice_key] = (
+                        f"Could not save that voice sample: {_speaker_error_message(error)}"
+                    )
+                st.session_state[setup_event_key] = setup_event.get("id")
+                st.rerun()
+
+            if pending_profiles:
+                st.markdown("**Recorded speakers**")
+                for profile in pending_profiles:
+                    st.write(f"• {profile['name']}")
+            else:
+                st.info("Add a sample for each person who will speak.")
+
+        with setup_right:
+            st.markdown("#### Meeting details")
+            with st.form("start_meeting_form", clear_on_submit=False):
+                title = st.text_input(
+                    "Meeting title",
+                    placeholder="Quarterly product review",
+                    key="new_meeting_title",
+                )
+                start_meeting = st.form_submit_button(
+                    "Start Meeting",
+                    type="primary",
+                    disabled=not pending_profiles,
+                )
+            if not pending_profiles:
+                st.caption("Record at least one speaker sample to enable the meeting.")
+
+            if start_meeting:
+                if not title.strip():
+                    st.error("Add a meeting title to continue.")
+                    return False
+
+                db_utils.init_db()
+                new_meeting_id, meeting_code = db_utils.create_meeting(
+                    title.strip(), date.today().isoformat(), user["user_id"]
+                )
+                for profile in pending_profiles:
+                    db_utils.upsert_speaker_profile(
+                        new_meeting_id,
+                        str(profile["name"]),
+                        profile["embedding"],
+                        int(profile["samples"]),
+                        profile["sample_audio"],
+                    )
+                st.session_state[f"speaker_profiles_{new_meeting_id}"] = [
+                    {key: value for key, value in profile.items() if key != "sample_audio"}
+                    for profile in pending_profiles
+                ]
+                st.session_state[pending_key] = []
+                st.session_state.host_meeting_id = new_meeting_id
+                st.session_state.host_meeting_code = meeting_code
+                st.session_state.host_minutes = None
+                st.rerun()
 
         recent_meetings = db_utils.get_recent_meetings(limit=8, user_id=user["user_id"])
         if recent_meetings:
@@ -315,6 +414,7 @@ def _render_host_mode() -> bool:
                 format_func=recent_meeting_label,
             )
             if st.button("Open meeting", key="open_recent_meeting"):
+                st.session_state[pending_key] = []
                 selected_meeting = recent_by_id[selected_meeting_id]
                 st.session_state.host_meeting_id = selected_meeting_id
                 st.session_state.host_meeting_code = selected_meeting["meeting_code"]
@@ -331,6 +431,9 @@ def _render_host_mode() -> bool:
 
     meeting = meeting_data["meeting"]
     is_ended = meeting.get("status") == "ended"
+    profile_key = f"speaker_profiles_{meeting_id}"
+    if profile_key not in st.session_state:
+        st.session_state[profile_key] = db_utils.get_speaker_profiles(meeting_id)
 
     header_left, header_right = st.columns([4, 1])
     with header_left:
@@ -370,18 +473,71 @@ def _render_host_mode() -> bool:
         speech_event = _live_speech(
             active=True,
             lang=SPEECH_LOCALES[selected_language],
+            speakerCount=len(st.session_state[profile_key]),
             key=f"live_speech_{meeting_id}",
             default=None,
         )
-        if isinstance(speech_event, dict) and speech_event.get("text"):
+        enrollment_notice_key = f"speaker_enrollment_notice_{meeting_id}"
+        if st.session_state.get(enrollment_notice_key):
+            st.success(st.session_state.pop(enrollment_notice_key))
+        if isinstance(speech_event, dict) and (
+            speech_event.get("text") or speech_event.get("utterances") or speech_event.get("enroll")
+        ):
             event_key = f"host_last_speech_id_{meeting_id}"
             if speech_event.get("id") != st.session_state.get(event_key):
-                _save_live_utterance(
-                    meeting_id,
-                    str(speech_event.get("speaker") or "Speaker 1"),
-                    str(speech_event["text"]),
-                )
+                enrollment_saved = False
+                if speech_event.get("enroll"):
+                    audio = speech_event.get("audio")
+                    try:
+                        from src.speaker_id import embedding_from_wav_base64
+
+                        if not audio:
+                            raise ValueError("No voice sample was captured. Try recording again.")
+                        profiles = st.session_state[profile_key]
+                        voice_embedding = embedding_from_wav_base64(str(audio))
+                        speaker = f"Speaker {len(profiles) + 1}"
+                        profiles.append(
+                            {
+                                "name": speaker,
+                                "embedding": voice_embedding.tolist(),
+                                "samples": 1,
+                            }
+                        )
+                        st.session_state[profile_key] = profiles
+                        st.success(f"Voice sample saved as {speaker}.")
+                        enrollment_saved = True
+                    except Exception as error:
+                        st.warning(
+                            f"Could not save the voice sample: {_speaker_error_message(error)}"
+                        )
+                else:
+                    from src.speaker_id import embedding_from_wav_base64, match_speaker
+
+                    utterances = speech_event.get("utterances") or [
+                        {"text": speech_event.get("text"), "audio": speech_event.get("audio")}
+                    ]
+                    for utterance in utterances:
+                        text = str(utterance.get("text") or "").strip()
+                        if not text:
+                            continue
+                        speaker = "Speaker ?"
+                        audio = utterance.get("audio")
+                        if audio:
+                            try:
+                                profiles = st.session_state[profile_key]
+                                voice_embedding = embedding_from_wav_base64(str(audio))
+                                speaker, profiles = match_speaker(voice_embedding, profiles)
+                            except Exception as error:
+                                st.warning(
+                                    f"Could not identify a speaker: {_speaker_error_message(error)}"
+                                )
+                        else:
+                            speaker = "Speaker ?"
+                        _save_live_utterance(meeting_id, speaker, text)
                 st.session_state[event_key] = speech_event.get("id")
+                if enrollment_saved:
+                    st.session_state[enrollment_notice_key] = f"Voice sample saved as {speaker}."
+                    st.rerun()
 
     meeting_data = db_utils.get_full_meeting_data(meeting_id)
     meeting = meeting_data["meeting"]
@@ -390,7 +546,9 @@ def _render_host_mode() -> bool:
     with transcript_col:
         st.markdown("#### Transcript")
         if not is_ended:
-            st.caption("Live microphone transcription · best-effort acoustic speaker labels")
+            st.caption(
+                "Enrollment voice profiles are saved with this meeting. Speak for at least one second per turn for reliable matching; live voice clips are not saved."
+            )
         if not transcript:
             st.info("Waiting for speech. Allow microphone access if your browser asks.")
         st.text_area(

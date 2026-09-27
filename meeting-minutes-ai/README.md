@@ -10,6 +10,22 @@ Use Python 3.10 or newer, then install dependencies:
 python -m pip install -r requirements.txt
 ```
 
+Install dependencies and launch Streamlit with the same Python interpreter. In
+this workspace, Streamlit runs from the parent folder's `.venv`:
+
+```powershell
+..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+..\.venv\Scripts\python.exe -m streamlit run app/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+Before a meeting starts, the host records a full sentence for each participant
+in the left setup panel and presses **Stop and save sample**. The original WAV samples and SpeechBrain ECAPA-TDNN voice
+embeddings are stored with the meeting in SQLite. During the meeting, transient
+utterance clips are sent to the Streamlit server to match against those profiles;
+the live clips are not stored. Transcript text and labels such as `Speaker 1`
+and `Speaker 2` are saved. The first speaker match downloads the pretrained
+model from Hugging Face.
+
 Initialize the database by importing and calling `init_db()` from `db/db_utils.py`:
 
 ```python

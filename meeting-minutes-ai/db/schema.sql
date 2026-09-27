@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS sentences (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS meeting_speakers (
+    speaker_profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id INTEGER NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+    speaker_name TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 1,
+    sample_audio BLOB,
+    UNIQUE (meeting_id, speaker_name)
+);
+
 CREATE TABLE IF NOT EXISTS action_items (
     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
     meeting_id INTEGER REFERENCES meetings(meeting_id),

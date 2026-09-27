@@ -10,3 +10,4 @@ openai-whisper
 pydub
 deep-translator
 joblib
+speechbrain

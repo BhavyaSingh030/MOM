@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import hashlib
+import json
 from pathlib import Path
 import secrets
 import sqlite3
@@ -148,6 +149,51 @@ def get_recent_meetings(limit: int = 10, user_id: int | None = None) -> list[dic
                 (user_id, limit),
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def upsert_speaker_profile(
+    meeting_id: int,
+    speaker_name: str,
+    embedding: Iterable[float],
+    sample_count: int = 1,
+    sample_audio: bytes | None = None,
+) -> None:
+    """Persist a meeting speaker's voice embedding and optional enrollment audio."""
+    with _connection() as connection:
+        connection.execute(
+            """INSERT INTO meeting_speakers
+               (meeting_id, speaker_name, embedding_json, sample_count, sample_audio)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(meeting_id, speaker_name) DO UPDATE SET
+                   embedding_json = excluded.embedding_json,
+                   sample_count = excluded.sample_count,
+                   sample_audio = COALESCE(excluded.sample_audio, meeting_speakers.sample_audio)""",
+            (
+                meeting_id,
+                speaker_name,
+                json.dumps([float(value) for value in embedding]),
+                max(1, int(sample_count)),
+                sample_audio,
+            ),
+        )
+
+
+def get_speaker_profiles(meeting_id: int) -> list[dict[str, Any]]:
+    """Return saved speaker labels and embeddings for a meeting."""
+    with _connection() as connection:
+        rows = connection.execute(
+            """SELECT speaker_name, embedding_json, sample_count
+               FROM meeting_speakers WHERE meeting_id = ? ORDER BY speaker_profile_id""",
+            (meeting_id,),
+        ).fetchall()
+    return [
+        {
+            "name": row["speaker_name"],
+            "embedding": json.loads(row["embedding_json"]),
+            "samples": int(row["sample_count"]),
+        }
+        for row in rows
+    ]
 
 
 def build_minutes_from_conversation(

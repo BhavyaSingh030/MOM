@@ -58,6 +58,10 @@
         background: #fff;
         border-color: #d9ded7;
       }
+      button:disabled {
+        opacity: 0.65;
+        cursor: wait;
+      }
     </style>
   </head>
   <body>
@@ -68,19 +72,35 @@
       </div>
       <div class="muted" id="detail">Waiting for the meeting to start listening.</div>
       <div class="interim" id="interim"></div>
+      <div class="muted" id="speakers">No speaker samples recorded yet.</div>
+      <button id="enroll" class="ghost" hidden>Record speaker sample</button>
+      <button id="stopEnroll" class="ghost" hidden>Stop and save sample</button>
       <button id="enable" class="ghost" hidden>Enable microphone</button>
     </div>
     <script>
       const SpeechAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
       let recognition = null;
+      let recognitionRetryTimer = null;
+      let recognitionRetryDelay = 800;
       let active = false;
       let lang = "en-US";
-      let speakers = [];
       let analyser = null;
       let audioCtx = null;
       let mediaStream = null;
-      let signatureTimer = null;
-      let signatureSamples = [];
+      let audioProcessor = null;
+      let mutedOutput = null;
+      let audioFrames = [];
+      let audioFrameSamples = 0;
+      let silentSamples = 0;
+      let completedVoiceSegments = [];
+      let pendingTranscripts = [];
+      let pendingTranscriptTimer = null;
+      let enrollmentMode = false;
+      let enrollmentTimer = null;
+      let enrollmentVoicedSamples = 0;
+      let enrollmentAvailable = false;
+      let suppressRecognitionUntil = 0;
+      let speakerCount = 0;
       let lastSentId = "";
 
       function sendMessage(type, payload) {
@@ -94,76 +114,201 @@
         sendMessage("streamlit:setFrameHeight", { height: document.body.scrollHeight });
       }
 
-      function sampleSignature() {
-        if (!analyser) return null;
-        const data = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(data);
-        const energy = data.reduce((sum, value) => sum + value, 0);
-        if (energy < 80) return null;
-        signatureSamples.push(Array.from(data));
-        if (signatureSamples.length > 20) signatureSamples.shift();
-      }
-
-      function fingerprint() {
-        if (!signatureSamples.length) return null;
-        const sampleCount = signatureSamples.length;
-        const vector = signatureSamples[0].map((_, index) =>
-          signatureSamples.reduce((total, sample) => total + sample[index], 0) / sampleCount
-        );
-        signatureSamples = [];
-        return vector;
-      }
-
-      function cosine(left, right) {
-        let dot = 0;
-        let leftNorm = 0;
-        let rightNorm = 0;
-        for (let i = 0; i < left.length; i += 1) {
-          const a = left[i] || 0;
-          const b = right[i] || 0;
-          dot += a * b;
-          leftNorm += a * a;
-          rightNorm += b * b;
+      function recordAudio(event) {
+        const samples = event.inputBuffer.getChannelData(0).slice();
+        let energy = 0;
+        for (let i = 0; i < samples.length; i += 1) energy += samples[i] * samples[i];
+        const speaking = Math.sqrt(energy / samples.length) > 0.003;
+        if (enrollmentMode) {
+          // Use the same voice activity gate for enrollment and meeting clips.
+          // Keeping silence in enrollment but dropping it from live clips makes
+          // otherwise identical voices produce less comparable embeddings.
+          if (speaking) {
+            audioFrames.push(samples);
+            audioFrameSamples += samples.length;
+            enrollmentVoicedSamples += samples.length;
+          }
+          if (audioFrameSamples >= audioCtx.sampleRate * 30) finishEnrollment(true);
+          return;
         }
-        if (!leftNorm || !rightNorm) return 0;
-        return dot / Math.sqrt(leftNorm * rightNorm);
+        if (speaking) {
+          audioFrames.push(samples);
+          audioFrameSamples += samples.length;
+          silentSamples = 0;
+          while (audioFrameSamples > audioCtx.sampleRate * 5 && audioFrames.length) {
+            audioFrameSamples -= audioFrames.shift().length;
+          }
+        } else if (audioFrames.length) {
+          silentSamples += samples.length;
+          if (silentSamples > audioCtx.sampleRate * 0.55) {
+            completedVoiceSegments.push({ frames: audioFrames, endedAt: Date.now() });
+            if (completedVoiceSegments.length > 8) completedVoiceSegments.shift();
+            audioFrames = [];
+            audioFrameSamples = 0;
+            silentSamples = 0;
+            flushPendingUtterances();
+          }
+        }
       }
 
-      function assignSpeaker(vector) {
-        if (!vector) {
-          return speakers.length ? speakers[speakers.length - 1].name : "Speaker 1";
-        }
-        let best = { score: 0, speaker: null };
-        speakers.forEach((speaker) => {
-          const score = cosine(vector, speaker.vector);
-          if (score > best.score) best = { score, speaker };
+      function makeSpeakerClip(frames) {
+        if (!audioCtx) return null;
+        if (!frames || !frames.length) return null;
+        const minimumSamples = audioCtx.sampleRate;
+        const sampleCount = frames.reduce((total, frame) => total + frame.length, 0);
+        // ECAPA embeddings from very short speech are unreliable. The backend
+        // requires at least one real second; do not pad/repeat speech because
+        // that distorts the voice characteristics.
+        if (sampleCount < minimumSamples) return null;
+        const source = new Float32Array(sampleCount);
+        let offset = 0;
+        frames.forEach((frame) => {
+          source.set(frame, offset);
+          offset += frame.length;
         });
-        if (best.speaker && best.score >= 0.82) {
-          best.speaker.vector = best.speaker.vector.map((value, index) =>
-            value * 0.7 + vector[index] * 0.3
-          );
-          return best.speaker.name;
+        const modelInput = source;
+        const outputLength = Math.floor(modelInput.length * 16000 / audioCtx.sampleRate);
+        const pcm = new Int16Array(outputLength);
+        for (let i = 0; i < outputLength; i += 1) {
+          const position = i * audioCtx.sampleRate / 16000;
+          const left = Math.floor(position);
+          const fraction = position - left;
+          const sample = (modelInput[left] || 0) * (1 - fraction) + (modelInput[left + 1] || 0) * fraction;
+          pcm[i] = Math.max(-1, Math.min(1, sample)) * (sample < 0 ? 32768 : 32767);
         }
-        const name = "Speaker " + (speakers.length + 1);
-        speakers.push({ name, vector });
-        return name;
+        const wav = new ArrayBuffer(44 + pcm.length * 2);
+        const view = new DataView(wav);
+        const writeText = (position, value) => {
+          for (let i = 0; i < value.length; i += 1) view.setUint8(position + i, value.charCodeAt(i));
+        };
+        writeText(0, "RIFF");
+        view.setUint32(4, 36 + pcm.length * 2, true);
+        writeText(8, "WAVE");
+        writeText(12, "fmt ");
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, 16000, true);
+        view.setUint32(28, 32000, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeText(36, "data");
+        view.setUint32(40, pcm.length * 2, true);
+        for (let i = 0; i < pcm.length; i += 1) view.setInt16(44 + i * 2, pcm[i], true);
+        const bytes = new Uint8Array(wav);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(binary);
+      }
+
+      function flushPendingUtterances(force = false) {
+        const now = Date.now();
+        const paired = [];
+        while (completedVoiceSegments.length && now - completedVoiceSegments[0].endedAt > 5000) {
+          completedVoiceSegments.shift();
+        }
+        while (pendingTranscripts.length && completedVoiceSegments.length) {
+          const transcript = pendingTranscripts.shift();
+          const segment = completedVoiceSegments.shift();
+          paired.push({ text: transcript.text, audio: makeSpeakerClip(segment.frames) });
+        }
+        while (force && pendingTranscripts.length) {
+          paired.push({ text: pendingTranscripts.shift().text, audio: null });
+        }
+        if (paired.length) emitUtterances(paired);
+        if (pendingTranscriptTimer) {
+          window.clearTimeout(pendingTranscriptTimer);
+          pendingTranscriptTimer = null;
+        }
+        if (pendingTranscripts.length) {
+          pendingTranscriptTimer = window.setTimeout(() => {
+            pendingTranscriptTimer = null;
+            flushPendingUtterances(true);
+          }, 1800);
+        }
+      }
+
+      function finishEnrollment(saveSample) {
+        if (!enrollmentMode) return;
+        enrollmentMode = false;
+        if (enrollmentTimer) window.clearTimeout(enrollmentTimer);
+        enrollmentTimer = null;
+        const button = document.getElementById("enroll");
+        const stopButton = document.getElementById("stopEnroll");
+        button.disabled = false;
+        button.textContent = "Record another speaker sample";
+        stopButton.hidden = true;
+        suppressRecognitionUntil = Date.now() + 1500;
+
+        if (!saveSample || enrollmentVoicedSamples < audioCtx.sampleRate) {
+          audioFrames = [];
+          audioFrameSamples = 0;
+          enrollmentVoicedSamples = 0;
+          completedVoiceSegments = [];
+          button.textContent = "Record speaker sample";
+          document.getElementById("detail").textContent =
+            "Sample was too short. Record at least one second of speech, then stop.";
+          setHeight();
+          return;
+        }
+
+        const audio = makeSpeakerClip(audioFrames);
+        audioFrames = [];
+        audioFrameSamples = 0;
+        silentSamples = 0;
+        enrollmentVoicedSamples = 0;
+        completedVoiceSegments = [];
+        if (!audio) {
+          document.getElementById("detail").textContent =
+            "Could not create the voice sample. Please record it again.";
+          button.textContent = "Record speaker sample";
+          setHeight();
+          return;
+        }
+        document.getElementById("detail").textContent = "Voice sample captured. Saving speaker profile…";
+        const id = Date.now() + "-" + Math.random().toString(16).slice(2);
+        sendMessage("streamlit:setComponentValue", { value: { id, enroll: true, audio } });
+        setHeight();
       }
 
       async function attachAnalyser() {
         if (analyser) return;
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioCtx = new AudioContext();
+        await audioCtx.resume();
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 256;
-        audioCtx.createMediaStreamSource(mediaStream).connect(analyser);
-        signatureSamples = [];
-        signatureTimer = window.setInterval(sampleSignature, 150);
+        const source = audioCtx.createMediaStreamSource(mediaStream);
+        source.connect(analyser);
+        audioProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+        audioProcessor.onaudioprocess = recordAudio;
+        mutedOutput = audioCtx.createGain();
+        mutedOutput.gain.value = 0;
+        source.connect(audioProcessor);
+        audioProcessor.connect(mutedOutput);
+        mutedOutput.connect(audioCtx.destination);
       }
 
       async function releaseAnalyser() {
-        if (signatureTimer) {
-          window.clearInterval(signatureTimer);
-          signatureTimer = null;
+        enrollmentMode = false;
+        if (enrollmentTimer) {
+          window.clearTimeout(enrollmentTimer);
+          enrollmentTimer = null;
+        }
+        if (pendingTranscriptTimer) {
+          window.clearTimeout(pendingTranscriptTimer);
+          pendingTranscriptTimer = null;
+        }
+        if (audioProcessor) {
+          audioProcessor.disconnect();
+          audioProcessor.onaudioprocess = null;
+          audioProcessor = null;
+        }
+        if (mutedOutput) {
+          mutedOutput.disconnect();
+          mutedOutput = null;
         }
         if (mediaStream) {
           mediaStream.getTracks().forEach((track) => track.stop());
@@ -174,30 +319,42 @@
           audioCtx = null;
           analyser = null;
         }
-        signatureSamples = [];
+        audioFrames = [];
+        audioFrameSamples = 0;
+        silentSamples = 0;
+        completedVoiceSegments = [];
+        pendingTranscripts = [];
       }
 
-      function emitUtterance(text, speaker) {
-        const trimmed = (text || "").trim();
-        if (!trimmed) return;
+      function emitUtterances(utterances) {
+        const items = utterances
+          .map((utterance) => ({ text: (utterance.text || "").trim(), audio: utterance.audio }))
+          .filter((utterance) => utterance.text);
+        if (!items.length) return;
         const id = Date.now() + "-" + Math.random().toString(16).slice(2);
         if (id === lastSentId) return;
         lastSentId = id;
         sendMessage("streamlit:setComponentValue", {
-          value: { id, text: trimmed, speaker, speakerCount: speakers.length },
+          value: { id, utterances: items },
         });
       }
 
-      function setStatus(listening, detail) {
+      function setStatus(listening, detail, label) {
         document.getElementById("dot").classList.toggle("on", listening);
-        document.getElementById("status").textContent = listening
+        document.getElementById("status").textContent = label || (listening
           ? "Listening"
-          : "Microphone idle";
+          : "Microphone idle");
         document.getElementById("detail").textContent = detail;
+        document.getElementById("enroll").hidden = !listening || !enrollmentAvailable || enrollmentMode;
+        document.getElementById("stopEnroll").hidden = !listening || !enrollmentAvailable || !enrollmentMode;
         setHeight();
       }
 
       function stopRecognition() {
+        if (recognitionRetryTimer) {
+          window.clearTimeout(recognitionRetryTimer);
+          recognitionRetryTimer = null;
+        }
         if (recognition) {
           recognition.onend = null;
           try {
@@ -206,6 +363,17 @@
         }
         recognition = null;
         setStatus(false, "Transcription paused.");
+      }
+
+      function scheduleRecognitionRestart(detail) {
+        if (!active || recognitionRetryTimer) return;
+        setStatus(true, detail || "Speech recognition paused; reconnecting…");
+        const delay = recognitionRetryDelay;
+        recognitionRetryDelay = Math.min(5000, Math.round(recognitionRetryDelay * 1.5));
+        recognitionRetryTimer = window.setTimeout(() => {
+          recognitionRetryTimer = null;
+          if (active && !recognition) startRecognition();
+        }, delay);
       }
 
       function startRecognition() {
@@ -220,38 +388,60 @@
         recognition.lang = lang;
         recognition.onresult = (event) => {
           let interim = "";
+          const finalTexts = [];
           for (let i = event.resultIndex; i < event.results.length; i += 1) {
             const result = event.results[i];
             const text = result[0].transcript;
             if (result.isFinal) {
-              emitUtterance(text, assignSpeaker(fingerprint()));
+              const cleanText = (text || "").trim();
+              if (cleanText && !enrollmentMode && Date.now() >= suppressRecognitionUntil) {
+                finalTexts.push(cleanText);
+              }
               document.getElementById("interim").textContent = "";
             } else {
               interim += text;
             }
           }
+          // Streamlit component values are state, so send all results in one
+          // payload. Each finalized sentence consumes a different voice clip.
+          if (finalTexts.length) {
+            recognitionRetryDelay = 800;
+            finalTexts.forEach((text) => pendingTranscripts.push({ text }));
+            flushPendingUtterances();
+          }
           if (interim) document.getElementById("interim").textContent = interim;
           setHeight();
         };
         recognition.onerror = (event) => {
-          if (event.error === "not-allowed") {
+          if (["not-allowed", "service-not-allowed", "audio-capture"].includes(event.error)) {
+            active = false;
             document.getElementById("enable").hidden = false;
-            setStatus(false, "Allow microphone access to transcribe the meeting.");
+            setStatus(false, event.error === "audio-capture"
+              ? "The microphone is unavailable. Check the selected input device."
+              : "Allow microphone access to transcribe the meeting.");
+          } else if (event.error !== "aborted") {
+            scheduleRecognitionRestart("Speech recognition paused; reconnecting…");
           }
         };
         recognition.onend = () => {
           recognition = null;
-          if (active) startRecognition();
+          if (active) scheduleRecognitionRestart("Speech recognition paused; reconnecting…");
         };
         try {
           recognition.start();
-          setStatus(true, "Best-effort speaker labels are added as people talk.");
+          setStatus(true, "Listening for speech. Recognition will reconnect if it pauses.");
         } catch (error) {
-          document.getElementById("enable").hidden = false;
+          recognition = null;
+          scheduleRecognitionRestart("Could not start speech recognition; retrying…");
         }
       }
 
       async function applyState(args) {
+        speakerCount = Number(args.speakerCount || 0);
+        enrollmentAvailable = Boolean(args.enrollmentOnly);
+        document.getElementById("speakers").textContent = speakerCount
+          ? speakerCount + " speaker sample" + (speakerCount === 1 ? "" : "s") + " recorded."
+          : "No speaker samples recorded yet.";
         const nextLang = args.lang || "en-US";
         const languageChanged = lang !== nextLang;
         const shouldListen = Boolean(args.active);
@@ -265,7 +455,11 @@
             await attachAnalyser();
             document.getElementById("enable").hidden = true;
             active = true;
-            startRecognition();
+            if (enrollmentAvailable) {
+              setStatus(true, "Record a full sentence from each speaker, then stop to save it.", "Ready for samples");
+            } else {
+              startRecognition();
+            }
           } catch (error) {
             document.getElementById("enable").hidden = false;
             setStatus(false, "Click enable microphone to start live transcription.");
@@ -296,10 +490,38 @@
           await attachAnalyser();
           document.getElementById("enable").hidden = true;
           active = true;
-          startRecognition();
+          if (enrollmentAvailable) {
+            setStatus(true, "Record a full sentence from each speaker, then stop to save it.", "Ready for samples");
+          } else {
+            startRecognition();
+          }
         } catch (error) {
           setStatus(false, "Microphone permission was denied.");
         }
+      });
+
+      document.getElementById("enroll").addEventListener("click", () => {
+        audioFrames = [];
+        audioFrameSamples = 0;
+        silentSamples = 0;
+        completedVoiceSegments = [];
+        pendingTranscripts = [];
+        enrollmentVoicedSamples = 0;
+        enrollmentMode = true;
+        const button = document.getElementById("enroll");
+        const stopButton = document.getElementById("stopEnroll");
+        button.disabled = true;
+        button.textContent = "Recording sample…";
+        stopButton.hidden = false;
+        document.getElementById("detail").textContent = "Say one complete sentence, then press Stop and save sample.";
+        enrollmentTimer = window.setTimeout(() => {
+          finishEnrollment(true);
+        }, 60000);
+        setHeight();
+      });
+
+      document.getElementById("stopEnroll").addEventListener("click", () => {
+        finishEnrollment(true);
       });
 
       sendMessage("streamlit:componentReady", { apiVersion: 1 });
