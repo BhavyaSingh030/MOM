@@ -1,0 +1,81 @@
+sentence,sentence_type
+We approved the revised launch date for October 12.,decision
+The team agreed to keep the current pricing for this quarter.,decision
+We will move the weekly review to Thursday mornings.,decision
+The final proposal is to use the existing vendor.,decision
+Leadership decided to pause the mobile redesign until next month.,decision
+We are going ahead with the smaller pilot group.,decision
+The deadline for the migration is now November 3.,decision
+Everyone agreed that the report should include regional totals.,decision
+We will close the old support queue after the backlog is cleared.,decision
+The group chose the blue packaging concept for the first release.,decision
+We decided to renew the office lease for one more year.,decision
+The new onboarding flow will launch to all customers at once.,decision
+We are keeping the current escalation process.,decision
+The committee approved the budget increase for testing.,decision
+We will not add another approval step to the form.,decision
+The data team will own the dashboard going forward.,decision
+We agreed to postpone the announcement until legal review is complete.,decision
+The pilot will include both new and returning customers.,decision
+We selected the second architecture because it is easier to maintain.,decision
+The project will use a monthly release schedule.,decision
+I'll send the revised budget to finance by Wednesday.,action_item
+Priya will confirm the supplier delivery date this afternoon.,action_item
+Please update the onboarding checklist before the next review.,action_item
+Jordan is responsible for sharing the survey results with the group.,action_item
+I will schedule a follow-up with the security team.,action_item
+Can you add the missing screenshots to the help article by Friday?,action_item
+The operations team needs to test the backup process this week.,action_item
+Marcus will prepare a draft of the customer announcement.,action_item
+Please ask legal to review the updated terms before launch.,action_item
+I'll investigate the login issue and report back tomorrow.,action_item
+Nina will upload the final slides to the shared folder.,action_item
+We need to send the revised contract to the vendor by Monday.,action_item
+Sam will check the translation with the regional offices.,action_item
+Please create a ticket for the analytics export request.,action_item
+I will bring three prototype options to our next meeting.,action_item
+Ravi needs to verify the totals in the quarterly report.,action_item
+The design team will deliver the updated icons next Tuesday.,action_item
+Please notify the pilot customers about the revised schedule.,action_item
+Elena will document the deployment steps after the release.,action_item
+I'll follow up with facilities about the conference room.,action_item
+Who can approve the final copy before it goes to print?,question
+What is the expected cost of supporting the additional region?,question
+Could we move the customer interview to the following week?,question
+Has anyone confirmed whether the vendor supports single sign-on?,question
+Which metric should we use to measure activation?,question
+Are there any risks with keeping both systems online during migration?,question
+When will the updated forecast be available?,question
+Does the new policy apply to contractors as well as employees?,question
+Can the team finish the accessibility review before launch?,question
+Why did the error rate increase after the latest deployment?,question
+Who should receive the weekly incident summary?,question
+Do we have enough support coverage for the holiday period?,question
+Would a smaller pilot give us useful feedback sooner?,question
+What information is still missing from the compliance packet?,question
+Have we received approval from the regional directors?,question
+Could the dashboard show results by customer segment?,question
+Is the current estimate based on the latest supplier quote?,question
+Which team owns the data retention settings?,question
+Should we include the archived accounts in this analysis?,question
+How will customers be notified if the service window changes?,question
+The current onboarding guide is difficult to follow on mobile.,discussion
+Several customers mentioned that the confirmation email arrived late.,discussion
+The support queue has been quieter since the status page update.,discussion
+Our regional teams use different names for the same account tier.,discussion
+The proposed layout gives the reporting table more room.,discussion
+We saw a small increase in sign-ups after the webinar.,discussion
+The vendor's latest estimate includes setup but not training.,discussion
+Most of the delay came from waiting for test credentials.,discussion
+The feedback form receives more responses when it is shorter.,discussion
+The east region still has a few older devices in circulation.,discussion
+The team has already documented the most common billing issues.,discussion
+Our first round of interviews included both managers and new hires.,discussion
+The draft release notes are clearer than the previous version.,discussion
+Some customers rely on the export feature for monthly audits.,discussion
+The API response time is stable under the current traffic level.,discussion
+We have not received comments on the revised support wording yet.,discussion
+The warehouse team is using a separate spreadsheet for exceptions.,discussion
+There is a noticeable difference between weekday and weekend usage.,discussion
+The new room booking process has reduced double reservations.,discussion
+The training session covered the updated password reset flow.,discussion

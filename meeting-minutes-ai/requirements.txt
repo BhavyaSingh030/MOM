@@ -1,0 +1,12 @@
+nltk
+spacy
+scikit-learn
+gensim
+sumy
+pandas
+numpy
+streamlit
+openai-whisper
+pydub
+deep-translator
+joblib

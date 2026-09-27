@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      body {
+        margin: 0;
+        font-family: Manrope, sans-serif;
+        color: #202522;
+        background: transparent;
+      }
+      .panel {
+        border: 1px solid #d9ded7;
+        background: #fff;
+        padding: 12px 14px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9aa39c;
+      }
+      .dot.on {
+        background: #e56d4a;
+        box-shadow: 0 0 0 4px rgba(229, 109, 74, 0.15);
+      }
+      .label {
+        font: 500 12px "DM Mono", monospace;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .muted {
+        color: #68716b;
+        font-size: 12px;
+        margin-top: 6px;
+      }
+      .interim {
+        margin-top: 8px;
+        font-size: 14px;
+        min-height: 1.3em;
+      }
+      button {
+        margin-top: 8px;
+        border: 1px solid #b9ee45;
+        background: #b9ee45;
+        color: #202522;
+        font-weight: 800;
+        min-height: 36px;
+        padding: 0 12px;
+        cursor: pointer;
+      }
+      button.ghost {
+        background: #fff;
+        border-color: #d9ded7;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <div class="row">
+        <span id="dot" class="dot"></span>
+        <span class="label" id="status">Microphone idle</span>
+      </div>
+      <div class="muted" id="detail">Waiting for the meeting to start listening.</div>
+      <div class="interim" id="interim"></div>
+      <button id="enable" class="ghost" hidden>Enable microphone</button>
+    </div>
+    <script>
+      const SpeechAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+      let recognition = null;
+      let active = false;
+      let lang = "en-US";
+      let speakers = [];
+      let analyser = null;
+      let audioCtx = null;
+      let mediaStream = null;
+      let signatureTimer = null;
+      let signatureSamples = [];
+      let lastSentId = "";
+
+      function sendMessage(type, payload) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type: type }, payload || {}),
+          "*"
+        );
+      }
+
+      function setHeight() {
+        sendMessage("streamlit:setFrameHeight", { height: document.body.scrollHeight });
+      }
+
+      function sampleSignature() {
+        if (!analyser) return null;
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        const energy = data.reduce((sum, value) => sum + value, 0);
+        if (energy < 80) return null;
+        signatureSamples.push(Array.from(data));
+        if (signatureSamples.length > 20) signatureSamples.shift();
+      }
+
+      function fingerprint() {
+        if (!signatureSamples.length) return null;
+        const sampleCount = signatureSamples.length;
+        const vector = signatureSamples[0].map((_, index) =>
+          signatureSamples.reduce((total, sample) => total + sample[index], 0) / sampleCount
+        );
+        signatureSamples = [];
+        return vector;
+      }
+
+      function cosine(left, right) {
+        let dot = 0;
+        let leftNorm = 0;
+        let rightNorm = 0;
+        for (let i = 0; i < left.length; i += 1) {
+          const a = left[i] || 0;
+          const b = right[i] || 0;
+          dot += a * b;
+          leftNorm += a * a;
+          rightNorm += b * b;
+        }
+        if (!leftNorm || !rightNorm) return 0;
+        return dot / Math.sqrt(leftNorm * rightNorm);
+      }
+
+      function assignSpeaker(vector) {
+        if (!vector) {
+          return speakers.length ? speakers[speakers.length - 1].name : "Speaker 1";
+        }
+        let best = { score: 0, speaker: null };
+        speakers.forEach((speaker) => {
+          const score = cosine(vector, speaker.vector);
+          if (score > best.score) best = { score, speaker };
+        });
+        if (best.speaker && best.score >= 0.82) {
+          best.speaker.vector = best.speaker.vector.map((value, index) =>
+            value * 0.7 + vector[index] * 0.3
+          );
+          return best.speaker.name;
+        }
+        const name = "Speaker " + (speakers.length + 1);
+        speakers.push({ name, vector });
+        return name;
+      }
+
+      async function attachAnalyser() {
+        if (analyser) return;
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new AudioContext();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        audioCtx.createMediaStreamSource(mediaStream).connect(analyser);
+        signatureSamples = [];
+        signatureTimer = window.setInterval(sampleSignature, 150);
+      }
+
+      async function releaseAnalyser() {
+        if (signatureTimer) {
+          window.clearInterval(signatureTimer);
+          signatureTimer = null;
+        }
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          mediaStream = null;
+        }
+        if (audioCtx) {
+          await audioCtx.close();
+          audioCtx = null;
+          analyser = null;
+        }
+        signatureSamples = [];
+      }
+
+      function emitUtterance(text, speaker) {
+        const trimmed = (text || "").trim();
+        if (!trimmed) return;
+        const id = Date.now() + "-" + Math.random().toString(16).slice(2);
+        if (id === lastSentId) return;
+        lastSentId = id;
+        sendMessage("streamlit:setComponentValue", {
+          value: { id, text: trimmed, speaker, speakerCount: speakers.length },
+        });
+      }
+
+      function setStatus(listening, detail) {
+        document.getElementById("dot").classList.toggle("on", listening);
+        document.getElementById("status").textContent = listening
+          ? "Listening"
+          : "Microphone idle";
+        document.getElementById("detail").textContent = detail;
+        setHeight();
+      }
+
+      function stopRecognition() {
+        if (recognition) {
+          recognition.onend = null;
+          try {
+            recognition.stop();
+          } catch (error) {}
+        }
+        recognition = null;
+        setStatus(false, "Transcription paused.");
+      }
+
+      function startRecognition() {
+        if (!SpeechAPI) {
+          setStatus(false, "Live transcription needs Chrome or Edge.");
+          return;
+        }
+        if (recognition) return;
+        recognition = new SpeechAPI();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = lang;
+        recognition.onresult = (event) => {
+          let interim = "";
+          for (let i = event.resultIndex; i < event.results.length; i += 1) {
+            const result = event.results[i];
+            const text = result[0].transcript;
+            if (result.isFinal) {
+              emitUtterance(text, assignSpeaker(fingerprint()));
+              document.getElementById("interim").textContent = "";
+            } else {
+              interim += text;
+            }
+          }
+          if (interim) document.getElementById("interim").textContent = interim;
+          setHeight();
+        };
+        recognition.onerror = (event) => {
+          if (event.error === "not-allowed") {
+            document.getElementById("enable").hidden = false;
+            setStatus(false, "Allow microphone access to transcribe the meeting.");
+          }
+        };
+        recognition.onend = () => {
+          recognition = null;
+          if (active) startRecognition();
+        };
+        try {
+          recognition.start();
+          setStatus(true, "Best-effort speaker labels are added as people talk.");
+        } catch (error) {
+          document.getElementById("enable").hidden = false;
+        }
+      }
+
+      async function applyState(args) {
+        const nextLang = args.lang || "en-US";
+        const languageChanged = lang !== nextLang;
+        const shouldListen = Boolean(args.active);
+        if (shouldListen && !active) {
+          lang = nextLang;
+          if (!SpeechAPI) {
+            setStatus(false, "Live transcription needs Chrome or Edge.");
+            return;
+          }
+          try {
+            await attachAnalyser();
+            document.getElementById("enable").hidden = true;
+            active = true;
+            startRecognition();
+          } catch (error) {
+            document.getElementById("enable").hidden = false;
+            setStatus(false, "Click enable microphone to start live transcription.");
+          }
+        } else if (!shouldListen && active) {
+          active = false;
+          lang = nextLang;
+          stopRecognition();
+          await releaseAnalyser();
+        } else if (shouldListen && recognition && languageChanged) {
+          lang = nextLang;
+          stopRecognition();
+          startRecognition();
+        } else {
+          lang = nextLang;
+        }
+        setHeight();
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.data && event.data.type === "streamlit:render") {
+          applyState(event.data.args || {});
+        }
+      });
+
+      document.getElementById("enable").addEventListener("click", async () => {
+        try {
+          await attachAnalyser();
+          document.getElementById("enable").hidden = true;
+          active = true;
+          startRecognition();
+        } catch (error) {
+          setStatus(false, "Microphone permission was denied.");
+        }
+      });
+
+      sendMessage("streamlit:componentReady", { apiVersion: 1 });
+      setHeight();
+    </script>
+  </body>
+</html>
